@@ -1,0 +1,11 @@
+<resources>
+    <!-- Fullscreen, no action bar, black background so there is never a flash of
+         white while Compose warms up on a cold boot. -->
+    <style name="Theme.CmacOps" parent="android:Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">#080808</item>
+        <item name="android:colorBackground">#080808</item>
+        <item name="android:statusBarColor">#080808</item>
+        <item name="android:navigationBarColor">#080808</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

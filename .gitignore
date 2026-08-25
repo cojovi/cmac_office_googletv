@@ -1,0 +1,25 @@
+*.iml
+.gradle/
+.idea/
+.DS_Store
+/build
+/app/build
+/captures
+.externalNativeBuild
+.cxx
+
+# Per-machine config — holds CMAC_SERVER_URL and the Mapbox token
+local.properties
+
+# Secrets and signing material — never commit these
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+*.crt
+keystore.properties
+secrets.properties

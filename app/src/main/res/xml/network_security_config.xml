@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The CMAC dashboard server is an internal LAN appliance served over plain HTTP
+  (same as the web dashboard today). Cleartext is permitted so the TV can reach
+  it; HTTPS is still used automatically for api.mapbox.com.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
