@@ -119,11 +119,14 @@ pins drawn in a single canvas pass replaces a continuously-rendering WebGL
 surface and ~380 animated DOM nodes. Trade-off: no extruded 3D buildings or
 camera fly-in.
 
-**The roster refreshes.** The web app fetched jobs once at page load, so a TV
-left up all day showed that morning's assignments until someone reloaded the
-browser. Here it re-polls on the server's own 5-minute cache TTL, retries with
-backoff after a failure, and refreshes immediately when the SSE stream
-reconnects — a server blip clears in seconds, not minutes.
+**The roster refreshes — on a deliberately slow clock.** The web app fetched jobs
+once at page load, so a TV left up all day showed that morning's assignments
+until someone reloaded the browser. Here counts and Slack mentions re-poll every
+5 minutes (cheap: `/api/jobs/counts` only needs Bolt's `/schedules`), while the
+job roster re-polls every **30 minutes** because it is drastically more expensive
+— see *Bolt rate limits* below. Failures back off, and a reconnecting SSE stream
+triggers an immediate refresh, so a server blip clears in seconds rather than
+minutes.
 
 **It survives being left alone.** Screen never sleeps, the last good payload is
 cached to disk so a reboot paints real data before the network is up, and the
@@ -140,6 +143,41 @@ If you want it, the honest options are a separate app on the TV or a licensed
 player — say the word and it can be added behind a config flag.
 
 ---
+
+## Known upstream issue: Bolt rate limits the roster build
+
+`/api/jobs/today` is far more expensive than its URL suggests. On a cache miss
+`buildJobsToday()` issues **one Bolt detail request and one Mapbox geocode per
+job**, five at a time. Measured against production (359 jobs) that call ran past
+**five minutes** and then failed outright with HTTP 429 — Bolt's rate limit —
+after which every subsequent request kept 429ing for a long window.
+
+This is pre-existing and not specific to this app: the web dashboard calls the
+same endpoint on every page load and will hit the same wall on a cold cache.
+
+Two consequences were designed around here:
+
+- **Client timeout.** The browser's `fetch()` has no deadline, so the web app
+  simply waited out the five minutes. A conventional 30–90 s HTTP timeout would
+  abandon every cold start and park the board on "DATA STALE" while the server
+  was working normally, so the roster call gets a 10-minute ceiling while the
+  cheap endpoints keep a 60-second one.
+- **Poll cadence.** The server caches for 5 minutes. Polling the roster on that
+  same 5-minute beat would miss the cache *every time* and re-trigger the whole
+  fan-out — thousands of Bolt calls an hour, keeping the account permanently
+  rate-limited. Hence the split cadence: counts every 5 minutes, roster every 30.
+
+Worth fixing **on the server**, in rough order of value:
+
+1. **Cache job details.** Addresses and coordinates for a given job number do not
+   change during a day. Persisting `fetchJobDetail` + geocode results (even to a
+   JSON file) turns the daily cost from ~359 requests *per cache miss* into ~359
+   *per day*, and makes a cold start near-instant.
+2. **Raise the roster cache TTL** above 5 minutes so ordinary refreshes stop
+   re-triggering the fan-out.
+3. **Lower concurrency or add jitter** in `mapConcurrent(summaries, 5, ...)`; the
+   current 429 retry ladder (1.5/3/4.5/6 s, 4 attempts) amplifies the burst
+   rather than smoothing it.
 
 ## Known upstream issue: geocoding puts jobs in the wrong state
 

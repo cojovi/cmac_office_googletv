@@ -82,6 +82,23 @@ has already been a real bug once:
   kotlinx.serialization is where breakage hides, and `proguard-rules.pro` is what
   prevents it.
 
+## Upstream cost model — do not "optimise" the poll cadence
+
+`/api/jobs/today` costs **one Bolt request + one Mapbox geocode per job** on a
+cache miss (~359 upstream calls, >5 min, and it 429s against real production).
+`/api/jobs/counts` is cheap by comparison — it only needs Bolt's `/schedules`.
+
+`DashboardRepository` therefore runs **two separate poll loops** on purpose:
+`fastPollLoop` (counts + mentions, 5 min) and `rosterPollLoop` (jobs, 30 min).
+Merging them back into one loop, or shortening `ROSTER_REFRESH_MS` to match the
+server's 5-minute cache TTL, would miss the cache on every poll and keep the
+Bolt account permanently rate-limited. Likewise `CmacApi.ROSTER_TIMEOUT_S` is
+10 minutes deliberately — a shorter client timeout abandons every cold start.
+
+When testing against the real server, be aware that a single cold
+`/api/jobs/today` can exhaust the Bolt quota for a long window. Prefer a local
+stub for iteration.
+
 ## Non-obvious gotchas
 
 - Orbitron has no `⊗ ○ ◄ ►` glyphs. Missing-glyph boxes on a wall display look

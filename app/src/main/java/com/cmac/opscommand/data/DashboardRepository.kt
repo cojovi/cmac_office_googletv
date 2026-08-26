@@ -67,32 +67,33 @@ class DashboardRepository(
             return
         }
         scope.launch { restoreCache() }
-        scope.launch { pollLoop() }
+        scope.launch { fastPollLoop() }
+        scope.launch { rosterPollLoop() }
         scope.launch { streamLoop() }
     }
 
     // -- REST polling ------------------------------------------------------
 
     /**
-     * The web app fetched the roster exactly once at page load, so a TV left up
-     * all day kept yesterday's — or this morning's — assignments on screen until
-     * someone reloaded the browser. Re-polling on the server's own 5-minute
-     * cache TTL keeps the board honest without adding load.
+     * Cheap endpoints — counts and Slack mentions — on a short cadence.
+     *
+     * `/api/jobs/counts` only needs Bolt's paginated `/schedules`, a handful of
+     * requests, so polling it often is safe and keeps the headline figures live.
      *
      * After a failure it retries far sooner than the steady-state interval:
-     * waiting the full 5 minutes meant a brief server blip left "DATA STALE" on
+     * waiting the full interval meant a brief server blip left "DATA STALE" on
      * the wall for minutes after the server was already answering again.
      */
-    private suspend fun pollLoop() {
+    private suspend fun fastPollLoop() {
         var failures = 0
         while (true) {
-            val ok = refreshAll()
+            val ok = refreshFast()
             failures = if (ok) 0 else (failures + 1).coerceAtMost(4)
 
             val wait = if (failures == 0) {
-                REFRESH_MS
+                FAST_REFRESH_MS
             } else {
-                (RETRY_BASE_MS shl (failures - 1)).coerceAtMost(REFRESH_MS)
+                (RETRY_BASE_MS shl (failures - 1)).coerceAtMost(FAST_REFRESH_MS)
             }
             // Wake early if something (e.g. the SSE stream reconnecting) tells
             // us the server is worth talking to again.
@@ -101,44 +102,107 @@ class DashboardRepository(
     }
 
     /**
-     * The three endpoints are independent, so they are fetched concurrently.
-     * Beyond being faster, this is what makes an outage visible promptly: run
-     * sequentially, three 10-second connect timeouts mean the header would keep
-     * claiming "DATA LIVE" for half a minute after the server had gone away.
+     * The job roster on a deliberately slow cadence.
+     *
+     * `/api/jobs/today` is enormously more expensive than it looks: on a cache
+     * miss the server issues one Bolt detail request *and* one Mapbox geocode
+     * per job. Measured against production that is ~359 upstream calls taking
+     * over five minutes, and Bolt rate-limits (HTTP 429) well before it
+     * finishes.
+     *
+     * The server caches for 5 minutes, so polling this every 5 minutes would
+     * miss the cache every single time and re-trigger the whole fan-out —
+     * thousands of Bolt calls an hour, keeping the account permanently
+     * rate-limited. The web app avoided that only by accident: it fetched the
+     * roster once per page load and never again, which is also why a TV left up
+     * all day showed stale assignments.
+     *
+     * Thirty minutes is the compromise: comfortably inside the server's cache
+     * behaviour, respectful of the upstream quota, and far fresher than "until
+     * somebody reloads the browser". Today's assignments do not churn faster
+     * than that.
      */
-    private suspend fun refreshAll(): Boolean = coroutineScope {
-        val countsD = async {
+    private suspend fun rosterPollLoop() {
+        var failures = 0
+        while (true) {
+            val ok = refreshRoster()
+            failures = if (ok) 0 else (failures + 1).coerceAtMost(3)
+
+            // Back off hard on failure — a 429 means the upstream is already
+            // over budget and retrying quickly makes it strictly worse.
+            val wait = if (failures == 0) {
+                ROSTER_REFRESH_MS
+            } else {
+                (ROSTER_RETRY_BASE_MS shl (failures - 1)).coerceAtMost(ROSTER_REFRESH_MS)
+            }
+            delay(wait)
+        }
+    }
+
+    /**
+     * Counts + mentions, fetched concurrently, each publishing the moment it
+     * lands rather than being batched behind the slower of the two.
+     *
+     * Concurrency is also what makes an outage visible promptly: run
+     * sequentially, two connect timeouts mean the header would keep claiming
+     * "DATA LIVE" long after the server had gone away.
+     */
+    private suspend fun refreshFast(): Boolean = coroutineScope {
+        val countsOk = async {
             runCatching { api.jobCounts() }
-                .onFailure { Log.w(TAG, "counts: ${it.message}") }.getOrNull()
+                .onFailure { Log.w(TAG, "counts: ${it.message}") }
+                .getOrNull()
+                ?.also { c -> _state.update { it.copy(counts = c) } } != null
         }
-        val jobsD = async {
-            runCatching { api.jobsToday() }
-                .onFailure { Log.w(TAG, "jobsToday: ${it.message}") }.getOrNull()
-        }
-        val mentionsD = async {
+
+        val mentionsOk = async {
             runCatching { api.mentions() }
-                .onFailure { Log.w(TAG, "mentions: ${it.message}") }.getOrNull()
+                .onFailure { Log.w(TAG, "mentions: ${it.message}") }
+                .getOrNull()
+                ?.also { m -> mergeMentions(m.mentions) } != null
         }
 
-        val counts = countsD.await()
-        val jobs = jobsD.await()
-        val mentions = mentionsD.await()
-        val anyOk = counts != null || jobs != null || mentions != null
+        val anyOk = countsOk.await() or mentionsOk.await()
+        publishDataState(anyOk)
+        anyOk
+    }
 
+    /** The expensive roster fetch; see [rosterPollLoop] for the cadence rationale. */
+    private suspend fun refreshRoster(): Boolean {
+        val jobs = runCatching { api.jobsToday() }
+            .onFailure { Log.w(TAG, "jobsToday: ${it.message}") }
+            .getOrNull()
+            ?: return false
+
+        _state.update {
+            it.copy(jobs = jobs.jobs, jobsUpdatedAt = jobs.updatedAt, jobsLoaded = true)
+        }
+        persistCache()
+        return true
+    }
+
+    /**
+     * Merge without letting a slow REST response clobber newer mentions that
+     * arrived over SSE while it was in flight.
+     */
+    private fun mergeMentions(incoming: List<Mention>) {
         _state.update { cur ->
-            cur.copy(
-                counts = counts ?: cur.counts,
-                jobs = jobs?.jobs ?: cur.jobs,
-                jobsUpdatedAt = jobs?.updatedAt ?: cur.jobsUpdatedAt,
-                jobsLoaded = cur.jobsLoaded || jobs != null,
-                mentions = mentions?.mentions?.sortedByDescending { m -> TimeUtil.sortKey(m.timestamp) }
-                    ?: cur.mentions,
+            val merged = (cur.mentions + incoming)
+                .distinctBy { x -> x.user + "|" + x.timestamp + "|" + x.text }
+                .sortedByDescending { x -> TimeUtil.sortKey(x.timestamp) }
+                .take(60)
+            cur.copy(mentions = merged)
+        }
+    }
+
+    private suspend fun publishDataState(anyOk: Boolean) {
+        _state.update {
+            it.copy(
                 dataState = if (anyOk) DataState.FRESH else DataState.STALE,
                 lastError = if (anyOk) null else "SERVER UNREACHABLE",
             )
         }
         if (anyOk) persistCache()
-        anyOk
     }
 
     // -- SSE ---------------------------------------------------------------
@@ -156,13 +220,18 @@ class DashboardRepository(
                     attempt = 0
                     when (ev) {
                         StreamEvent.Connected -> {
-                            val wasDown = _state.value.link != LinkState.LIVE
+                            // Only a genuine *recovery* warrants an extra fetch.
+                            // The very first connect is CONNECTING -> LIVE, and
+                            // the poll loops have already fired by then, so
+                            // treating that as a recovery just duplicated both
+                            // cheap requests a few seconds into every startup.
+                            val recovered = _state.value.link == LinkState.DOWN
                             _state.update { it.copy(link = LinkState.LIVE) }
                             // The stream coming back is proof the server is
                             // reachable, so pull fresh REST data immediately
                             // instead of sitting on stale numbers until the
                             // next poll window.
-                            if (wasDown) refreshRequests.trySend(Unit)
+                            if (recovered) refreshRequests.trySend(Unit)
                         }
 
                         StreamEvent.Disconnected -> {
@@ -229,10 +298,23 @@ class DashboardRepository(
     }
 
     companion object {
-        /** Matches the server's own CACHE_TTL, so we never poll into a cold cache. */
-        const val REFRESH_MS = 5 * 60 * 1000L
+        /** Counts + mentions: cheap upstream, safe to poll often. */
+        const val FAST_REFRESH_MS = 5 * 60 * 1000L
 
-        /** First retry delay after a failed refresh; doubles up to [REFRESH_MS]. */
+        /** First retry after a failed fast refresh; doubles up to [FAST_REFRESH_MS]. */
         const val RETRY_BASE_MS = 20 * 1000L
+
+        /**
+         * Job roster: ~one Bolt request + one geocode *per job* on a cache miss.
+         * Deliberately slow to stay inside the upstream rate limit — see
+         * [rosterPollLoop].
+         */
+        const val ROSTER_REFRESH_MS = 30 * 60 * 1000L
+
+        /**
+         * First retry after a failed roster fetch. Starts high because the most
+         * likely failure is HTTP 429, where retrying quickly is actively harmful.
+         */
+        const val ROSTER_RETRY_BASE_MS = 5 * 60 * 1000L
     }
 }
