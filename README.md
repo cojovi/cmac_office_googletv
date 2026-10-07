@@ -1,249 +1,272 @@
-# CMAC Field Operations Command — Google TV / Android TV
+<!-- COJOVI / SIGNAL — CMAC Office Google TV edition. Ship with readme-assets/. -->
+<a name="top"></a>
 
-Native Android TV rewrite of the `CMAC_Office_dash` browser dashboard. Same three
-boards, same data, same HUD look — built to live on a wall unattended instead of
-in a browser tab someone has to babysit.
+<p align="center">
+  <img src="readme-assets/banner.svg" alt="CMAC Office Google TV — field operations on the wall." width="100%">
+</p>
 
-<pre>
-CMAC_Office_dash  (Node + Express)          cmac_office_googletv  (this repo)
-├─ Bolt API + pagination                    ├─ native client of the same API
-├─ Mapbox geocoding (token server-side)     ├─ Compose UI, fixed 1920x1080
-├─ Slack WebSocket -> SSE relay             ├─ D-pad control, keep-screen-on
-└─ /api/* + /api/events  ────────────────>  └─ boots itself after a power cut
-</pre>
+<h1 align="center">CMAC Office Google TV</h1>
 
-**The backend does not change.** This app is a drop-in replacement for the
-browser, so the Bolt credentials, the geocoding and the Slack relay all stay on
-the server exactly as they are today. Keep running `CMAC_Office_dash` — the TV
-just points at it instead of Chrome doing so.
+<p align="center">
+  <strong>Keep the work visible. Put the dashboard on the wall.</strong><br>
+  A native Google TV / Android TV client for CMAC Field Operations Command.
+</p>
+
+<p align="center">
+  <img src="readme-assets/stack.svg" alt="Kotlin · Jetpack Compose · OkHttp + SSE · Mapbox Static" width="640">
+</p>
+
+<p align="center">
+  <a href="#overview">Overview</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#remote-controls">Remote controls</a> ·
+  <a href="#validation">Validation</a> ·
+  <a href="#security">Security</a>
+</p>
 
 ---
 
-## 1. Configure
+<a name="overview"></a>
+## `> meet_the_tv_client`
 
-Create/edit `local.properties` in the repo root (gitignored, never committed):
+**Three boards. One native TV surface. The existing backend.** This repository replaces the browser presentation of `CMAC_Office_dash` with a Kotlin / Jetpack Compose application: operations overview, paged assignments, and field communications.
+
+| See the territory | Follow the assignments | Keep the conversation visible |
+| :--- | :--- | :--- |
+| Mapbox dark imagery, work-type-colored job pins, and animated counts. | An automatically paged roster with address, community, office, work types, crew, and status. | Eight recent mentions on Overview, twelve on Comms, and recent-message highlighting. |
+
+The custom HUD uses bundled Orbitron and Rajdhani fonts, scanlines, corner brackets, and a **1920 × 1080 design space** scaled to the display. It uses Compose UI/foundation rather than Material components. The activity requests immersive fullscreen and keep-screen-on while displayed.
+
+> [!IMPORTANT]
+> **This is a client, not the server.** Keep `CMAC_Office_dash` running. Bolt credentials, job-detail retrieval, geocoding, and the Slack WebSocket relay stay on that server. The TV calls its REST/SSE endpoints and separately requests Mapbox static imagery with a public token.
+
+<a name="architecture"></a>
+## `> trace_the_signal`
+
+<p align="center">
+  <img src="readme-assets/flow.svg" alt="Bolt and Slack integrations → existing CMAC_Office_dash backend → native TV dashboard over REST and SSE. Mapbox imagery is requested separately by the TV." width="100%">
+</p>
+
+```text
+Bolt + Slack                  Existing CMAC_Office_dash
+                              ├─ job retrieval + geocoding
+                              └─ REST API + Slack-to-SSE relay
+                                          ↓
+                              Native TV dashboard
+                              ├─ polling + SSE + saved snapshot
+                              ├─ Overview / Assignments / Comms
+                              └─ Mapbox Static Images over HTTPS
+```
+
+### Client API contract
+
+All routes are relative to `CMAC_SERVER_URL`; trailing slashes are trimmed. The client sends `Accept: application/json` for REST, and `Accept: text/event-stream` plus `Cache-Control: no-cache` for SSE. It does **not** configure an authorization header or interactive login.
+
+| Route | Payload consumed by the TV |
+| :--- | :--- |
+| `GET /api/jobs/counts` | `gutterCount`, `reroofsCount`, `garageDoorsCount`, `tractRoofingCount`, `totalJobs`, `updatedAt`. |
+| `GET /api/jobs/today` | `jobs`, `total`, `updatedAt`; each job has `job_number`, `address`, `community`, `office`, `stage`, `work_order_types`, `crews`, `lat`, `lng`. |
+| `GET /api/slack/mentions` | `mentions` with `user`, `text`, `timestamp`, `channel`, `permalink`. |
+| `GET /api/events` | JSON envelopes: `{"type":"mention","mention":{...}}` or `{"type":"jobCounts","data":{...}}`. |
+
+Models supply defaults for missing fields and ignore unknown keys; this is not a guarantee that arbitrary malformed payloads parse. SSE uses the JSON envelope's `type`, not the SSE event-name field; malformed/unrecognized events are ignored. There is no event-ID replay implementation. Mention ordering uses `timestamp`; a separate Slack `ts` field is ignored by the model.
+
+<a name="quickstart"></a>
+## `> bring_it_online`
+
+**Prerequisites:** a running compatible backend reachable from the TV, Git, JDK 17+, Android SDK 36, Android platform-tools (`adb`), and a Google TV / Android TV device with API 26 or newer. Match the pinned toolchain rather than assuming any installed Android Studio version will work.
+
+| Build setting | Declared value |
+| :--- | :--- |
+| Gradle wrapper / Android Gradle Plugin | `9.5.0` / `9.3.1` |
+| Compose and serialization compiler plugins | `2.4.0` |
+| Compose BOM | `2026.06.01` |
+| Android SDK | Compile/target `36`; minimum `26` |
+| Java source/target | `17` |
+| Application ID / version | `com.cmac.opscommand` / `1.0.0` (code `1`) |
+
+AGP 9 provides built-in Kotlin support; the project deliberately does not apply `org.jetbrains.kotlin.android`. These are source declarations, not a verified toolchain compatibility report.
+
+### 1. Get the source and configure the build
+
+```bash
+git clone https://github.com/cojovi/cmac_office_googletv.git
+cd cmac_office_googletv
+```
+
+Create **`local.properties`** in the repository root; replace these safe examples with your deployment values:
 
 ```properties
-sdk.dir=C:/Users/<you>/AppData/Local/Android/Sdk
-
-# Base URL of the running CMAC_Office_dash Express server
-CMAC_SERVER_URL=http://192.168.1.50:3000
-
-# Mapbox *public* (pk.) token — the same one already in the server's .env.
-# Optional: leave blank and the map panel shows the same "MAP UNAVAILABLE"
-# placeholder the web dashboard shows without a token.
-CMAC_MAPBOX_TOKEN=pk.your_public_token
+sdk.dir=/absolute/path/to/Android/Sdk
+CMAC_SERVER_URL=https://dashboard.example.com
+CMAC_MAPBOX_TOKEN=pk.REPLACE_WITH_PUBLIC_TOKEN
 ```
 
-Any of these can also be passed per-build: `-PCMAC_SERVER_URL=...`.
+The server URL must resolve from the **TV**, not just your workstation. On Windows, use the local SDK path with forward slashes, such as `C:/Users/YOUR_USER/AppData/Local/Android/Sdk`. Leave `CMAC_MAPBOX_TOKEN` blank if no map is needed.
 
-Build with nothing configured and the app says so on screen rather than showing
-an empty dashboard.
-
-> The Mapbox token is a *public* token. The web app already ships it to every
-> browser that loads the page (`window.MAPBOX_TOKEN`), so putting it in the APK
-> is the same exposure, not new exposure. The Bolt credentials never leave the
-> server.
-
-## 2. Build
+### 2. Build a development APK
 
 ```bash
-./gradlew assembleDebug          # dev build
-./gradlew assembleRelease        # minified, ~1.7 MB
-./gradlew testDebugUnitTest      # map projection / framing tests
+./gradlew assembleDebug
 ```
 
-Requires JDK 17+ (JDK 21 used here) and Android SDK 36. Gradle 9.5 and
-AGP 9.3.1 — note AGP 9 has **built-in Kotlin support**, so there is deliberately
-no `org.jetbrains.kotlin.android` plugin.
+On Windows use `gradlew.bat`. The debug APK is `app/build/outputs/apk/debug/app-debug.apk`.
 
-## 3. Install on a TV
+### 3. Install and open on the TV
 
-Enable developer mode on the TV (Settings → System → About → click *Build* 7x),
-then turn on **USB debugging** and **Network debugging**.
+Enable developer options (typically Settings → System → About → select Build seven times), then the debugging options provided by that device. Authorize the workstation. Network-debugging menus and pairing requirements vary by firmware; use the TV's displayed address/port or a supported USB connection.
 
 ```bash
-adb connect 192.168.1.222:5555        # the TV's IP
+# Example host only; replace with your TV's debugging address.
+adb connect tv.example.com:5555
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n com.cmac.opscommand/.MainActivity
 ```
 
-It registers under `LEANBACK_LAUNCHER`, so after the first install it appears on
-the Android TV / Google TV home row and launches like any other app. It also
-relaunches itself on `BOOT_COMPLETED`.
+The manifest registers `LEANBACK_LAUNCHER` and a `BOOT_COMPLETED` receiver. The receiver **attempts** to relaunch the activity; verify reboot behavior on the actual device. This is not a device-owner kiosk, launcher replacement, or guarantee against Android/OEM background-start restrictions.
 
-## 4. Remote control
+<a name="configuration"></a>
+## `> configure_the_display`
 
-The web dashboard's page dots and LOCK button were mouse targets, which is
-useless on a TV. Everything is on the remote:
+| Input | Behavior |
+| :--- | :--- |
+| `CMAC_SERVER_URL` | Required backend base URL. A blank value displays `SERVER NOT CONFIGURED` and does not start the repository. |
+| `CMAC_MAPBOX_TOKEN` | Optional public Mapbox `pk.` token for Static Images. A blank value displays `MAP UNAVAILABLE / SET CMAC_MAPBOX_TOKEN`. |
+| `sdk.dir` | Android SDK location in `local.properties`; not an application setting. |
+
+**These values are compiled into the APK.** There is no in-app configuration screen. Rebuild and reinstall after changing the server URL or token. `CMAC_MAPBOX_TOKEN` becomes `BuildConfig.MAPBOX_TOKEN`; the server setting remains `BuildConfig.CMAC_SERVER_URL`.
+
+Configuration resolution in `app/build.gradle.kts` is:
+
+1. `local.properties`.
+2. Gradle project properties, including `-P` flags and `gradle.properties`.
+3. Environment variables.
+4. An empty string.
+
+> [!WARNING]
+> **Blank properties still take precedence.** The checked-in `gradle.properties` declares both deployment keys as blank, so environment variables are normally masked. Likewise, a key in `local.properties` wins over `-P`, even when blank. Omit a key from higher-priority files if you intend to use a lower-priority source.
+
+For a command-line build, first remove that key from `local.properties`:
+
+```bash
+./gradlew assembleDebug -PCMAC_SERVER_URL=https://dashboard.example.com
+```
+
+Keep real endpoints and tokens in local deployment configuration, not tracked examples. Use simple URL/token values: the Gradle script interpolates them directly into generated string literals without explicit escaping.
+
+<a name="remote-controls"></a>
+## `> take_the_remote`
 
 | Key | Action |
-| --- | --- |
-| **LEFT / RIGHT** | previous / next board |
-| **OK / ENTER / PLAY-PAUSE** | hold or resume the 15 s auto-rotation (the old LOCK) |
-| **UP / DOWN** | page the assignment roster by hand |
-| **1 / 2 / 3** | jump straight to Overview / Assignments / Comms |
+| :--- | :--- |
+| Right / Media Next / Page Down | Next board. |
+| Left / Media Previous / Page Up | Previous board. |
+| OK / Enter / Numpad Enter / Space / Play-Pause | Toggle hold/resume for board rotation and automatic roster paging. |
+| Down / Up | Switch to Assignments and move the roster forward/backward. |
+| `1` / `2` / `3` | Jump to Overview / Assignments / Comms. |
+
+Boards rotate every **15 seconds**. The roster advances every **5 seconds**, only while Assignments is visible and not locked. Rows per page follow the measured table height; the roster position is retained between board visits within the running ViewModel, not saved across restarts.
+
+Manual navigation does **not** automatically enable hold or reset the timer. Press OK to hold a board before reading it. Locking does not stop polling or SSE updates. Keys are global actions; Back/Home retain platform behavior rather than enforcing a kiosk lock.
+
+<a name="resilience"></a>
+## `> read_the_health_signals`
+
+| Mechanism | Source behavior |
+| :--- | :--- |
+| Counts + mentions polling | Concurrent requests at startup; wait 5 minutes after a successful round. Failure waits: 20, 40, 80, then 160 seconds. |
+| Roster polling | Independent request at startup; wait 30 minutes after success. Failure waits: 5, 10, then 20 minutes. |
+| REST timeouts | 10-second connect timeout; counts/mentions read timeout 60 seconds, roster 600 seconds. Total call deadlines are 90 and 630 seconds respectively. |
+| SSE reconnect | Retry delay grows from 6 to 30 seconds; any received stream event resets the attempt counter. No streaming read timeout. |
+| SSE recovery/disconnection | Wakes the **fast** poll loop; does not force a roster refresh or interrupt a request already running. |
+
+Intervals are waits after work completes, not fixed wall-clock schedules. Fast polling considers the round successful when **either** counts or mentions succeeds; a partial failure therefore does not enter its failure backoff.
+
+### What the header does—and does not—prove
+
+- `DATA SYNCING` is the initial state. `DATA LIVE` means at least one fast endpoint succeeded in the latest round; `DATA STALE` means both failed. **Roster failures do not change this indicator.** Check the roster's `AS OF` timestamp too.
+- `SLACK ONLINE / LINKING / OFFLINE` reflects the TV-to-server SSE connection, **not** independently verified Slack upstream health.
+- `SYS ACTIVE` is always displayed as active; it is not a backend health probe.
+- Times use the TV's system timezone. Recent-message styling uses a three-hour timestamp window.
+
+### Saved data is a fallback, not an offline guarantee
+
+The app stores counts, jobs, roster timestamp, and mentions in `filesDir/dashboard_snapshot.json`. It restores this snapshot at startup and writes it after successful fast polling or roster retrieval. SSE-only changes are not immediately persisted. Mentions are deduplicated by user/timestamp/text, sorted newest-first, and capped at 60.
+
+There is **no snapshot expiry, backend-URL namespace, or encryption layer in this implementation**. Cached data may belong to an earlier day or deployment; clear app storage when repurposing a TV or switching backend. A failed/corrupt cache read is ignored. Coil separately uses `cacheDir/map_cache` with a 32 MiB disk limit and a memory-cache budget of 20% of available app memory; cached imagery can be evicted and a changed map request may need the network.
+
+<a name="limitations"></a>
+## `> know_the_edges`
+
+**Roster cost belongs to the backend.** The original documentation and source comments report expensive cold-cache `/api/jobs/today` builds, per-job Bolt detail/geocoding fan-out, and HTTP 429s. Those production observations are not newly verified here. The TV's longer timeout and slower polling reduce pressure; they do not fix server-side rate limiting. Avoid repeated restarts as a refresh strategy.
+
+Server-side follow-up remains: cache job details and geocodes, increase roster-cache lifetime, and review concurrency/retry jitter. The backend implementation is not included in this repository, so verify its current behavior before changing it.
+
+**Framing is not geocoding correction.** The original documentation reports incomplete address fields producing out-of-state matches. Fix city/state/postcode extraction and service-area bias or bounds on the backend. The TV uses a 3rd–97th percentile camera frame when there are at least 12 valid points; smaller sets use ordinary bounds. Off-frame points are retained in the dataset and counted as `N OF M PINS OUTSIDE FRAME`, but not visible outside the clipped map. Jobs with null, invalid, or effectively `(0,0)` coordinates have no map pin; their roster rows remain.
+
+**The map is static imagery, not interactive Mapbox GL.** It uses `mapbox/dark-v11` with a local animated pin layer; there are no extruded 3D buildings, map gestures, or camera fly-in. The YouTube mini-player from the browser dashboard is not implemented, and there is no player configuration flag.
+
+<a name="validation"></a>
+## `> check_before_you_ship`
+
+From the repository root, in a configured Android development environment:
+
+```bash
+./gradlew testDebugUnitTest
+./gradlew assembleDebug
+./gradlew assembleRelease
+```
+
+`GeoTest.kt` covers Mercator projection, bounds/framing, and coordinate filtering. `ModelParsingTest.kt` covers REST/SSE payload parsing, defaults, and timestamp handling. These commands and test sources are present; **this documentation refresh did not run builds or tests** and makes no passing-suite or APK-size claim.
+
+Release builds enable code minification and resource shrinking. **No release signing configuration is declared.** Configure private signing before distributing an installable production release; do not assume `assembleRelease` produces a signed deployment artifact.
+
+- [ ] Verify the pinned toolchain resolves and both tests and builds complete.
+- [ ] Confirm backend routes and payloads from the intended TV network.
+- [ ] Check server URL/public token baked into the installed APK.
+- [ ] Exercise all remote mappings, hold/resume, and roster pagination.
+- [ ] Check 1080p/4K sizing, overscan, clock/timezone, and map placement on the target panel.
+- [ ] Test cold start, slow roster response, network loss/recovery, cached-data age, and reboot behavior.
+- [ ] Review API access controls, release signing, map attribution, and TV debugging exposure.
+
+<a name="security"></a>
+## `> draw_the_boundary`
+
+| Protect | Deployment rule |
+| :--- | :--- |
+| Backend credentials | Bolt credentials, Slack credentials, and server geocoding configuration remain server-side. Never add private keys to the APK. |
+| Public map token | Only a public `pk.` token belongs in `CMAC_MAPBOX_TOKEN`. APK contents are extractable; review Mapbox scopes, restrictions, and usage limits. |
+| Transport and access | The manifest's network-security configuration permits cleartext **globally, including release builds**. Prefer HTTPS and a restricted network; this client has no built-in API authentication flow. |
+| Operational data | Addresses, crews, and messages appear on the wall and in the saved snapshot. Restrict physical/device access; automatic Android backup is disabled, but that is not encryption. |
+| Developer access | Limit ADB to authorized maintenance connections; disable unnecessary debugging after deployment. |
+| Repository hygiene | Keep `local.properties`, `.env` files, keystores, signing configuration, and generated APKs private/out of source control. |
+
+The static-image request disables Mapbox's embedded logo/attribution. Review applicable attribution requirements and the actual TV UI before distribution; a source comment alone is not proof of compliance. No repository license file was found in this revision—do not assume an MIT or other grant.
+
+<a name="source-map"></a>
+## `> explore_the_source`
+
+| Location | Responsibility |
+| :--- | :--- |
+| [`app/build.gradle.kts`](app/build.gradle.kts) | Deployment properties, SDKs, dependencies, release settings. |
+| [`MainActivity.kt`](app/src/main/java/com/cmac/opscommand/MainActivity.kt) / [`BootReceiver.kt`](app/src/main/java/com/cmac/opscommand/BootReceiver.kt) | TV window flags, global keys, boot-start attempt. |
+| [`data/`](app/src/main/java/com/cmac/opscommand/data/) | Wire models, HTTP/SSE, polling, snapshot, map maths, timestamps. |
+| [`ui/`](app/src/main/java/com/cmac/opscommand/ui/) | Boards, rotation, roster paging, fixed-stage layout, map, HUD theme. |
+| [`CmacApp.kt`](app/src/main/java/com/cmac/opscommand/CmacApp.kt) | Coil image loader and map-image caches. |
+| [`app/src/test/`](app/src/test/) | JVM projection and parsing tests. |
 
 ---
 
-## Parity with the web dashboard
+<p align="center">
+  <img src="readme-assets/signal-divider.svg" alt="" width="100%">
+</p>
 
-| Web behaviour | Here |
-| --- | --- |
-| 3 boards, 15 s rotation, LOCK to pause | same, on the remote |
-| Fixed 1920x1080 layout | same, authored in a 1920x1080 design space and mapped to the panel by density, so it is pixel-faithful on 1080p and stays sharp on 4K |
-| Stat cards with 1.4 s ease-out count-up | same |
-| `#` / address / community / office / types / crew / status table | same, plus paging |
-| Slack sidebar (8) and full comms feed (12) | same |
-| Messages < 3 h highlighted green | same, plus an explicit `<3H` badge |
-| SSE: live mentions + 5-minute count pushes | same |
-| Mapbox dark-v11 map with job pins | same imagery via the Static Images API |
-| Orbitron + Rajdhani, scanlines, corner brackets, grid | same, bundled (no webfont fetch) |
-| YouTube mini-player | **not carried over** — see below |
+<p align="center">
+  <strong>The same operations. A native place on the wall.</strong><br>
+  <sub>A <a href="https://github.com/cojovi">Cody / cojovi</a> project · <a href="https://cojovi.com">cojovi.com</a><br>
+  CMAC Field Operations Command · Presented in COJOVI / SIGNAL.</sub>
+</p>
 
-## What is deliberately different
-
-**Assignments are paged instead of clipped.** The web table rendered all 381
-rows into an `overflow: hidden` box, so everything past roughly the first 19 was
-unreachable on a TV. Here the roster pages itself every 5 s, keeps its place
-between visits, and the header states which slice is showing (`VIEW 3/16`).
-
-**Pins are coloured by work-order type.** The web legend advertised five colours
-but `updateMapMarkers()` painted every marker the same red, so the legend never
-matched the map. Now it does.
-
-**The map is a static image, not a live GL context.** The web app started a full
-Mapbox GL renderer and then disabled scroll, drag, rotate, pitch, keyboard and
-double-click zoom — nobody touches a TV above a register. One cached PNG plus
-pins drawn in a single canvas pass replaces a continuously-rendering WebGL
-surface and ~380 animated DOM nodes. Trade-off: no extruded 3D buildings or
-camera fly-in.
-
-**The roster refreshes — on a deliberately slow clock.** The web app fetched jobs
-once at page load, so a TV left up all day showed that morning's assignments
-until someone reloaded the browser. Here counts and Slack mentions re-poll every
-5 minutes (cheap: `/api/jobs/counts` only needs Bolt's `/schedules`), while the
-job roster re-polls every **30 minutes** because it is drastically more expensive
-— see *Bolt rate limits* below. Failures back off, and a reconnecting SSE stream
-triggers an immediate refresh, so a server blip clears in seconds rather than
-minutes.
-
-**It survives being left alone.** Screen never sleeps, the last good payload is
-cached to disk so a reboot paints real data before the network is up, and the
-header distinguishes `DATA LIVE` / `DATA SYNCING` / `DATA STALE` from
-`SLACK ONLINE` / `SLACK OFFLINE` so a glance tells you what is actually broken.
-
-**No Material.** Every surface is custom-drawn to match the HUD design, so
-`material3` and `tv-material` would be dead weight. Release APK is ~1.7 MB.
-
-**YouTube mini-player omitted.** The web build hardcodes a playlist `<iframe>`.
-Embedding YouTube in a WebView on Android TV is unreliable (autoplay gesture
-requirements, embed restrictions) and is not something to hang a 24/7 display on.
-If you want it, the honest options are a separate app on the TV or a licensed
-player — say the word and it can be added behind a config flag.
-
----
-
-## Known upstream issue: Bolt rate limits the roster build
-
-`/api/jobs/today` is far more expensive than its URL suggests. On a cache miss
-`buildJobsToday()` issues **one Bolt detail request and one Mapbox geocode per
-job**, five at a time. Measured against production (359 jobs) that call ran past
-**five minutes** and then failed outright with HTTP 429 — Bolt's rate limit —
-after which every subsequent request kept 429ing for a long window.
-
-This is pre-existing and not specific to this app: the web dashboard calls the
-same endpoint on every page load and will hit the same wall on a cold cache.
-
-Two consequences were designed around here:
-
-- **Client timeout.** The browser's `fetch()` has no deadline, so the web app
-  simply waited out the five minutes. A conventional 30–90 s HTTP timeout would
-  abandon every cold start and park the board on "DATA STALE" while the server
-  was working normally, so the roster call gets a 10-minute ceiling while the
-  cheap endpoints keep a 60-second one.
-- **Poll cadence.** The server caches for 5 minutes. Polling the roster on that
-  same 5-minute beat would miss the cache *every time* and re-trigger the whole
-  fan-out — thousands of Bolt calls an hour, keeping the account permanently
-  rate-limited. Hence the split cadence: counts every 5 minutes, roster every 30.
-
-Worth fixing **on the server**, in rough order of value:
-
-1. **Cache job details.** Addresses and coordinates for a given job number do not
-   change during a day. Persisting `fetchJobDetail` + geocode results (even to a
-   JSON file) turns the daily cost from ~359 requests *per cache miss* into ~359
-   *per day*, and makes a cold start near-instant.
-2. **Raise the roster cache TTL** above 5 minutes so ordinary refreshes stop
-   re-triggering the fan-out.
-3. **Lower concurrency or add jitter** in `mapConcurrent(summaries, 5, ...)`; the
-   current 429 retry ladder (1.5/3/4.5/6 s, 4 attempts) amplifies the burst
-   rather than smoothing it.
-
-## Known upstream issue: geocoding puts jobs in the wrong state
-
-Not introduced here — it is in the server's geocoder, and it is why
-`map_error.png` and `wrong_address.png` in the web repo show pins across Portland,
-Miami and Toronto for a Dallas/Austin company. `wrong_address.png` shows the
-popup for "729 Vineyard Way … Dallas" with its pin in **Florida**.
-
-Cause, in `server.js` → `buildJobsToday()`:
-
-```js
-const city  = details.city || details.city_name || '';
-const state = details.state || details.state_code || details.state_name || '';
-const zip   = details.zip  || details.zip_code   || ...;
-const geocodeQuery = [street, city, state, zip].filter(Boolean).join(', ');
-```
-
-When Bolt's `/open/v1/jobs/{n}` response does not carry those keys under the
-guessed names, the query collapses to the street line alone and Mapbox returns
-the first match anywhere in the US.
-
-Two fixes worth applying **on the server**:
-
-1. **Bias the geocoder to the service area.** Smallest, highest-value change —
-   add a bounding box to the request in `geocodeAddress()`:
-   ```js
-   params: { access_token: MAPBOX_TOKEN, limit: 1, country: 'US',
-             bbox: '-106.65,25.84,-93.51,36.50' }   // Texas
-   ```
-2. **Stop losing the city.** `office` *is* populated (`Dallas`, `Austin`,
-   `Doors DFW`) — fall back to it, and log the real field names once to fix the
-   guesses: the `console.log('[bolt job fields]', ...)` already in
-   `fetchJobDetail()` prints them on the first request.
-
-Until that is fixed, this app frames the map to the 3rd–97th percentile of pins
-rather than their outright extremes, so a handful of strays cannot zoom the
-camera out to the whole continent. **No pin is hidden** — every job is still
-drawn, and the panel reports `N OF M PINS OUTSIDE FRAME` so the problem stays
-visible instead of being quietly swallowed. Framing was chosen over discarding
-suspicious jobs because the legitimate Houston and San Antonio clusters sit
-~3.3° from Dallas, further than any fixed "plausible radius" that still catches
-an out-of-state stray.
-
-## Layout
-
-```
-app/src/main/java/com/cmac/opscommand/
-├─ MainActivity.kt          fullscreen, keep-screen-on, D-pad mapping
-├─ CmacApp.kt               Coil image loader + disk cache for map tiles
-├─ BootReceiver.kt          relaunch after power cut
-├─ data/
-│  ├─ Models.kt             API wire models (lenient: defaults everywhere)
-│  ├─ CmacApi.kt            OkHttp + kotlinx.serialization over /api/*
-│  ├─ EventStream.kt        /api/events as a Flow (okhttp-sse)
-│  ├─ DashboardRepository.kt polling, backoff, SSE, disk cache
-│  ├─ Geo.kt                Mercator projection + robust bounds framing
-│  └─ TimeUtil.kt           tolerant timestamp parsing (ISO / epoch / Slack ts)
-└─ ui/
-   ├─ DashboardScreen.kt    header, board host, page dots
-   ├─ DashboardViewModel.kt rotation, hold, roster paging, clock
-   ├─ Components.kt         FixedStage, corner-bracket cards, scanlines
-   ├─ Widgets.kt            stat cards, badges, tags, Slack rows
-   ├─ MapPanel.kt           static map + single-pass pin layer
-   ├─ OverviewPage.kt / JobsPage.kt / CommsPage.kt
-   └─ theme/Hud.kt          colour + type tokens ported from styles.css
-```
-
-`Geo.kt` is covered by unit tests (`./gradlew testDebugUnitTest`) because the pin
-positions come from our own projection maths rather than a map SDK.
+<p align="center"><a href="#top">↑ Back to the signal</a></p>
